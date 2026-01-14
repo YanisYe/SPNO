@@ -347,7 +347,7 @@ def main():
     physics_loss_fn = None
     physics_weight_scheduler = None
     if use_physics_loss:
-        from phys_loss_v2 import create_physics_loss, create_physics_weight_scheduler
+        from phys_loss import create_physics_loss, create_physics_weight_scheduler
        
         physics_loss_fn = create_physics_loss(
             nlat=lat_high, 

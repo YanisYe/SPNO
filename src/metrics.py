@@ -105,7 +105,7 @@ def lat_weighted_mse_pde_loss_gradient(pred, y, vars, pde_weight, lat, mask=None
     return loss_dict
 
 
-def lat_weighted_mse(pred, y, vars,  lat, mask=None, inp_vars=None):
+def lat_weighted_mse(pred, y, vars,  lat, mask=None, inp_vars=None, variable_weights=None):
     """Latitude weighted mean squared error
 
     Allows to weight the loss by the cosine of the latitude to account for gridding differences at equator vs. poles.
@@ -115,6 +115,7 @@ def lat_weighted_mse(pred, y, vars,  lat, mask=None, inp_vars=None):
         pred: [B, V, H, W]
         vars: list of variable names
         lat: H
+        variable_weights: dict, optional, variable-specific weights, e.g., {"geopotential_500": 2.0, "temperature_850": 1.5}
     """
 
     error = (pred - y) ** 2  # [N, C, H, W]
@@ -129,6 +130,17 @@ def lat_weighted_mse(pred, y, vars,  lat, mask=None, inp_vars=None):
     w_lat = w_lat / w_lat.mean()  # (H, )
     w_lat = w_lat.unsqueeze(0).unsqueeze(-1)  # (1, H, 1)
 
+    # 变量特定权重
+    if variable_weights is None:
+        variable_weights = {}
+    
+    # 创建权重张量 [V]
+    var_weights_tensor = torch.ones(len(vars), dtype=error.dtype, device=error.device)
+    for i, var in enumerate(vars):
+        if var in variable_weights:
+            var_weights_tensor[i] = variable_weights[var]
+    var_weights_tensor = var_weights_tensor.view(1, -1, 1, 1)  # (1, V, 1, 1)
+
     loss_dict = {}
     with torch.no_grad():
         for i, var in enumerate(vars):
@@ -137,10 +149,13 @@ def lat_weighted_mse(pred, y, vars,  lat, mask=None, inp_vars=None):
             else:
                 loss_dict[var] = (error[:, i] * w_lat).mean()
 
+    # 应用变量权重
+    weighted_error = error * var_weights_tensor
+    
     if mask is not None:
-        loss_dict["loss"] = ((error * w_lat.unsqueeze(1)).mean(dim=1) * mask).sum() / mask.sum()
+        loss_dict["loss"] = ((weighted_error * w_lat.unsqueeze(1)).mean(dim=1) * mask).sum() / mask.sum()
     else:
-        loss_dict["loss"] = (error * w_lat.unsqueeze(1)).mean(dim=1).mean()
+        loss_dict["loss"] = (weighted_error * w_lat.unsqueeze(1)).mean(dim=1).mean()
 
     return loss_dict
 

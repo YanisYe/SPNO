@@ -55,6 +55,10 @@ class PhysicsLossS2(nn.Module):
         use_divergence: bool = True,
         use_vorticity: bool = True,
         use_vapor: bool = True,
+        geopotential_weight: float = 0.5,
+        temperature_weight: float = 0.5,
+        use_geopotential: bool = False,
+        use_temperature: bool = False,
     ):
         super().__init__()
         
@@ -67,6 +71,10 @@ class PhysicsLossS2(nn.Module):
         self.use_divergence = use_divergence
         self.use_vorticity = use_vorticity
         self.use_vapor = use_vapor
+        self.geopotential_weight = geopotential_weight
+        self.temperature_weight = temperature_weight
+        self.use_geopotential = use_geopotential
+        self.use_temperature = use_temperature
         
         # 获取球面积分权重
         _, q = _precompute_latitudes(nlat=nlat, grid=grid)
@@ -324,7 +332,7 @@ class PhysicsLossS2(nn.Module):
                 }
         
         loss_dict = {}
-        total_loss = 0.0
+        total_loss = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         
         # 提取风场分量
         if "u_wind" in variable_indices and "v_wind" in variable_indices:
@@ -338,10 +346,14 @@ class PhysicsLossS2(nn.Module):
             
             # 1. 散度约束损失
             if self.use_divergence:
-                div_loss_pred = self.compute_divergence_loss(u_pred, v_pred)
-                div_loss_target = self.compute_divergence_loss(u_target, v_target)
-                # 使用目标散度作为参考（理想情况下应该接近0）
-                divergence_loss = div_loss_pred * self.divergence_weight
+                # 计算散度值
+                div_pred = self.compute_divergence(u_pred, v_pred)
+                div_tgt = self.compute_divergence(u_target.detach(), v_target.detach())
+                # 计算差值的平方
+                div_diff_sq = torch.square(div_pred - div_tgt)
+                # 球面积分
+                divergence_loss = torch.sum(div_diff_sq * self.quad_weights, dim=(-2, -1))
+                divergence_loss = torch.mean(divergence_loss) * self.divergence_weight
                 loss_dict["physics/divergence"] = divergence_loss
                 total_loss += divergence_loss
             
@@ -359,18 +371,131 @@ class PhysicsLossS2(nn.Module):
                 q_pred = pred[:, q_idx, :, :]
                 q_target = target[:, q_idx, :, :]
                 
-                # 计算预测的水汽输送损失
-                vapor_loss_pred = self.compute_vapor_transport_loss(u_pred, v_pred, q_pred)
-                # 计算目标的水汽输送损失（作为参考）
-                vapor_loss_target = self.compute_vapor_transport_loss(u_target, v_target, q_target)
-                # 使用预测的损失（理想情况下应该接近目标）
-                vapor_loss = vapor_loss_pred * self.vapor_weight
+                # 计算水汽通量
+                u_vapor_pred = u_pred * q_pred
+                v_vapor_pred = v_pred * q_pred
+                u_vapor_tgt = u_target * q_target
+                v_vapor_tgt = v_target * q_target
+                
+                # 计算水汽散度值
+                vapor_div_pred = self.compute_divergence(u_vapor_pred, v_vapor_pred)
+                vapor_div_tgt = self.compute_divergence(u_vapor_tgt.detach(), v_vapor_tgt.detach())
+                
+                # 计算差值的平方
+                vapor_div_diff_sq = torch.square(vapor_div_pred - vapor_div_tgt)
+                # 球面积分
+                vapor_loss = torch.sum(vapor_div_diff_sq * self.quad_weights, dim=(-2, -1))
+                vapor_loss = torch.mean(vapor_loss) * self.vapor_weight
                 loss_dict["physics/vapor_transport"] = vapor_loss
                 total_loss += vapor_loss
+        
+        # 4. 位势高度梯度约束
+        if self.use_geopotential and out_variables is not None:
+            geopotential_idx = None
+            for i, var in enumerate(out_variables):
+                if "geopotential_500" in var.lower():
+                    geopotential_idx = i
+                    break
+            
+            if geopotential_idx is not None:
+                geopotential_pred = pred[:, geopotential_idx, :, :]
+                geopotential_target = target[:, geopotential_idx, :, :]
+                geopotential_loss = self.compute_geopotential_gradient_loss(
+                    geopotential_pred, geopotential_target
+                ) * self.geopotential_weight
+                loss_dict["physics/geopotential_gradient"] = geopotential_loss
+                total_loss += geopotential_loss
+        
+        # 5. 温度平滑性约束
+        if self.use_temperature and out_variables is not None:
+            temperature_idx = None
+            for i, var in enumerate(out_variables):
+                if "temperature_850" in var.lower():
+                    temperature_idx = i
+                    break
+            
+            if temperature_idx is not None:
+                temperature_pred = pred[:, temperature_idx, :, :]
+                temperature_target = target[:, temperature_idx, :, :]
+                temperature_loss = self.compute_temperature_smoothness_loss(
+                    temperature_pred, temperature_target
+                ) * self.temperature_weight
+                loss_dict["physics/temperature_smoothness"] = temperature_loss
+                total_loss += temperature_loss
         
         loss_dict["physics/total"] = total_loss
         
         return loss_dict
+    
+    def compute_geopotential_gradient_loss(self, geopotential_pred: torch.Tensor, 
+                                          geopotential_target: torch.Tensor) -> torch.Tensor:
+        """
+        计算位势高度的梯度约束损失（静力平衡约束）
+        
+        位势高度的梯度应该与目标一致，这有助于保持静力平衡
+        
+        Parameters
+        ----------
+        geopotential_pred : torch.Tensor
+            预测的位势高度，形状为 (batch, nlat, nlon)
+        geopotential_target : torch.Tensor
+            目标的位势高度，形状为 (batch, nlat, nlon)
+        
+        Returns
+        -------
+        loss : torch.Tensor
+            梯度约束损失（标量）
+        """
+        # 计算梯度
+        grad_lat_pred, grad_lon_pred = self.compute_gradients(geopotential_pred)
+        grad_lat_tgt, grad_lon_tgt = self.compute_gradients(geopotential_target.detach())
+        
+        # 计算梯度差的平方
+        grad_diff_sq = torch.square(grad_lat_pred - grad_lat_tgt) + torch.square(grad_lon_pred - grad_lon_tgt)
+        
+        # 球面积分
+        loss = torch.sum(grad_diff_sq * self.quad_weights, dim=(-2, -1))
+        return torch.mean(loss)
+    
+    def compute_temperature_smoothness_loss(self, temperature_pred: torch.Tensor,
+                                           temperature_target: torch.Tensor) -> torch.Tensor:
+        """
+        计算温度场的平滑性约束损失
+        
+        温度场应该保持平滑，避免不合理的突变
+        
+        Parameters
+        ----------
+        temperature_pred : torch.Tensor
+            预测的温度，形状为 (batch, nlat, nlon)
+        temperature_target : torch.Tensor
+            目标的温度，形状为 (batch, nlat, nlon)
+        
+        Returns
+        -------
+        loss : torch.Tensor
+            平滑性约束损失（标量）
+        """
+        # 计算二阶导数（拉普拉斯算子）来衡量平滑性
+        grad_lat_pred, grad_lon_pred = self.compute_gradients(temperature_pred)
+        grad_lat_tgt, grad_lon_tgt = self.compute_gradients(temperature_target.detach())
+        
+        # 计算二阶导数
+        grad2_lat_pred, _ = self.compute_gradients(grad_lat_pred)
+        _, grad2_lon_pred = self.compute_gradients(grad_lon_pred)
+        grad2_lat_tgt, _ = self.compute_gradients(grad_lat_tgt)
+        _, grad2_lon_tgt = self.compute_gradients(grad_lon_tgt)
+        
+        # 拉普拉斯算子：二阶导数的和
+        laplacian_pred = grad2_lat_pred + grad2_lon_pred
+        laplacian_tgt = grad2_lat_tgt + grad2_lon_tgt
+        
+        # 计算拉普拉斯差的平方
+        laplacian_diff_sq = torch.square(laplacian_pred - laplacian_tgt)
+        
+        # 球面积分
+        loss = torch.sum(laplacian_diff_sq * self.quad_weights, dim=(-2, -1))
+        return torch.mean(loss)
 
 
 def create_physics_loss(
@@ -383,6 +508,10 @@ def create_physics_loss(
     use_divergence: bool = True,
     use_vorticity: bool = True,
     use_vapor: bool = True,
+    geopotential_weight: float = 0.5,
+    temperature_weight: float = 0.5,
+    use_geopotential: bool = False,
+    use_temperature: bool = False,
 ) -> PhysicsLossS2:
     """
     创建物理损失函数的便捷函数
@@ -423,6 +552,10 @@ def create_physics_loss(
         use_divergence=use_divergence,
         use_vorticity=use_vorticity,
         use_vapor=use_vapor,
+        geopotential_weight=geopotential_weight,
+        temperature_weight=temperature_weight,
+        use_geopotential=use_geopotential,
+        use_temperature=use_temperature,
     )
 
 

@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader, IterableDataset
 from torchvision.transforms import transforms
 
 # from src.climax.pretrain.datamodule import collate_fn
-from dataset_STAttn import (
+from .dataset_STAttn import (
     # Forecast,
     IndividualForecastDataIter,
     NpyReader,
@@ -124,7 +124,7 @@ class GlobalForecastDataModule(LightningDataModule):
                     myForecast(
                         myNpyReader(
                             file_list=self.lister_train,
-                            start_idx=8,
+                            start_idx=-(2+1),
                             end_idx=100,
                             variables=self.hparams.variables,
                             out_variables=self.hparams.out_variables,

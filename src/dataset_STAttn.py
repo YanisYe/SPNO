@@ -163,7 +163,7 @@ class myForecast(IterableDataset):
             y = torch.from_numpy(y)
 
             # inputs = x[6000: 6801] 上一次的
-            inputs = x[0:1000000:6]
+            inputs = x[0:-1:6]
 
             if self.random_lead_time:
                 predict_ranges = torch.randint(low=1, high=self.max_predict_range, size=(inputs.shape[0],))
@@ -186,13 +186,16 @@ class myIndividualForecastDataIter(IterableDataset):
         self.region_info = region_info
 
     def __iter__(self):
+        """
+        inp: [B, T, L, C, H, W] weather input sequence
+        out: [B, T, L, C_out, H, W] weather output sequence
+        lead_times: [B, T, L] lead times
+        variables: [B, T, L, C] weather variables
+        out_variables: [B, T, L, C_out] weather output variables
+        region_info: [B, T, L, 2] region information
+        """
         for (inp, out, lead_times, variables, out_variables) in self.dataset:
             assert inp.shape[0] == out.shape[0]
-            # for i in range(inp.shape[0]):
-            #     if self.region_info is not None:
-            #         yield self.transforms(inp[i]), self.output_transforms(out[i]), lead_times[i], variables, out_variables, self.region_info
-            #     else:
-            #         yield self.transforms(inp[i]), self.output_transforms(out[i]), lead_times[i], variables, out_variables
             frame = 1
             skip = 0
             for i in range(skip*frame, inp.shape[0]):
